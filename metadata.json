@@ -1,0 +1,6 @@
+{
+  "name": "UTM Johor Shuttle & Campus Navigator",
+  "description": "Campus navigation map for Universiti Teknologi Malaysia (UTM) Johor Bahru with time-based shuttle tracking and integrated OpenStreetMap walking directions.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": []
+}
