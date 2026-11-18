@@ -121,7 +121,13 @@ function BusDetails({
             </p>
             {svc && (
               <p className="truncate text-xs text-muted-foreground">
-                {svc.via}
+                {st.kind !== "off" &&
+                st.trip.dir === "back" &&
+                (st.trip.service.route === "EN" ||
+                  st.trip.service.route === "ED" ||
+                  st.trip.service.route === "EW")
+                  ? "Returning to KDOJ · via Jln Amal · KRP G11 (skips CP)"
+                  : svc.via}
                 {!runs && ` · ${runDaysLabel(bus)}`}
               </p>
             )}

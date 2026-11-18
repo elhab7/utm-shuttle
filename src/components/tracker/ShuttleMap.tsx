@@ -1,25 +1,18 @@
-import { useEffect, useMemo, useRef } from "react";
-import {
-  APILoadingStatus,
-  APIProvider,
-  AdvancedMarker,
-  AdvancedMarkerAnchorPoint,
-  ColorScheme,
-  Map as GoogleMap,
-  useApiLoadingStatus,
-  useMap,
-  useMapsLibrary,
-} from "@vis.gl/react-google-maps";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type LType from "leaflet";
 import { ROUTE_META, type RouteKey } from "@/data/schedule";
 import { STOP_BY_ID, STOPS } from "@/data/stops";
 import type { Journey, Place } from "@/lib/journey";
-import { BUSES, busState, ROUTES, SERVICES, serviceRunsOn } from "@/lib/shuttle";
+import { BUSES, busState, metres, ROUTES, SERVICES, serviceRunsOn } from "@/lib/shuttle";
+import { cn } from "@/lib/utils";
 import {
-  BusMarkerIcon,
-  DestinationMarkerIcon,
-  PoiMarkerIcon,
-  StopMarkerIcon,
-  UserLocationDot,
+  busMarkerSpec,
+  destinationMarkerSpec,
+  poiMarkerSpec,
+  routeArrowSpec,
+  stopMarkerSpec,
+  userDotSpec,
+  type MarkerIconSpec,
 } from "./map-icons";
 import type { Clock, Selection } from "./types";
 import type { PlaceEntry } from "./use-places";
@@ -43,27 +36,141 @@ type Props = {
   fitKey: string;
 };
 
-const CAMPUS = { lat: 1.5615, lng: 103.638 };
-const MAPS_LIBRARIES = ["marker"];
+const CAMPUS: [number, number] = [1.5615, 103.638];
+
+function toDivIcon(L: typeof LType, spec: MarkerIconSpec): LType.DivIcon {
+  return L.divIcon({
+    html: spec.html,
+    iconSize: spec.size,
+    iconAnchor: spec.anchor,
+    className: "utm-osm-icon",
+  });
+}
+
+function bearingDeg(a: [number, number], b: [number, number]): number {
+  const k = Math.PI / 180;
+  const x = (b[1] - a[1]) * k * Math.cos(((a[0] + b[0]) / 2) * k);
+  const y = (b[0] - a[0]) * k;
+  return (Math.atan2(x, y) * 180) / Math.PI;
+}
+
+function sampleRouteArrows(
+  path: [number, number][],
+  stepM = 190,
+): Array<{ pos: [number, number]; heading: number }> {
+  const arrows: Array<{ pos: [number, number]; heading: number }> = [];
+  if (path.length < 2) return arrows;
+  let nextTarget = 70;
+  let dist = 0;
+
+  for (let i = 1; i < path.length; i++) {
+    const a = path[i - 1]!;
+    const b = path[i]!;
+    const seg = metres(a, b);
+    if (seg < 1) continue;
+    while (dist + seg >= nextTarget) {
+      const t = (nextTarget - dist) / seg;
+      arrows.push({
+        pos: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t],
+        heading: bearingDeg(a, b),
+      });
+      nextTarget += stepM;
+    }
+    dist += seg;
+  }
+  return arrows;
+}
 
 export function ShuttleMap(props: Props) {
-  const apiKey = import.meta.env["VITE_GOOGLE_MAPS_API_KEY"] ?? "";
   const {
     clock,
     visibleBuses,
     showBusStops,
     pois,
+    poiFitNonce = 0,
     selection,
     onSelect,
     dark,
+    focusNonce,
     userLocation,
+    locateNonce,
     journey,
     journeyFrom,
     journeyTo,
+    fitKey,
   } = props;
+
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const leafletRef = useRef<typeof LType | null>(null);
+  const mapRef = useRef<LType.Map | null>(null);
+  const [mapReady, setMapReady] = useState(false);
+
+  const routesLayerRef = useRef<LType.LayerGroup | null>(null);
+  const journeyLayerRef = useRef<LType.LayerGroup | null>(null);
+  const stopsLayerRef = useRef<LType.LayerGroup | null>(null);
+  const poisLayerRef = useRef<LType.LayerGroup | null>(null);
+  const busLayerRef = useRef<LType.LayerGroup | null>(null);
+  const busMarkersRef = useRef(new Map<string, { marker: LType.Marker; iconKey: string }>());
+  const userHaloRef = useRef<LType.Circle | null>(null);
+  const userMarkerRef = useRef<LType.Marker | null>(null);
+  const originMarkerRef = useRef<LType.Marker | null>(null);
+  const destMarkerRef = useRef<LType.Marker | null>(null);
 
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
+
+  // Initialize Leaflet + OpenStreetMap lazily on the client so SSR remains window-safe.
+  useEffect(() => {
+    let cancelled = false;
+    const container = containerRef.current;
+    if (!container) return;
+
+    void import("leaflet").then((mod) => {
+      if (cancelled || !containerRef.current) return;
+      const L = (mod.default ?? mod) as typeof LType;
+      leafletRef.current = L;
+
+      const map = L.map(containerRef.current, {
+        center: CAMPUS,
+        zoom: 15,
+        minZoom: 13,
+        maxZoom: 19,
+        zoomControl: false,
+        attributionControl: true,
+      });
+
+      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution:
+          '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>',
+      }).addTo(map);
+
+      routesLayerRef.current = L.layerGroup().addTo(map);
+      journeyLayerRef.current = L.layerGroup().addTo(map);
+      stopsLayerRef.current = L.layerGroup().addTo(map);
+      poisLayerRef.current = L.layerGroup().addTo(map);
+      busLayerRef.current = L.layerGroup().addTo(map);
+
+      map.on("click", () => onSelectRef.current(null));
+
+      mapRef.current = map;
+      setMapReady(true);
+    });
+
+    return () => {
+      cancelled = true;
+      busMarkersRef.current.clear();
+      userHaloRef.current = null;
+      userMarkerRef.current = null;
+      originMarkerRef.current = null;
+      destMarkerRef.current = null;
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+      }
+      setMapReady(false);
+    };
+  }, []);
 
   const activeServices = useMemo(
     () => SERVICES.filter((s) => serviceRunsOn(s, clock.day) && visibleBuses.has(s.bus)),
@@ -162,387 +269,356 @@ export function ShuttleMap(props: Props) {
     return items;
   }, [clock.day, clock.minutes, visibleBuses, showBusStops, selection, journey]);
 
-  return (
-    <div className="absolute inset-0 z-0 isolate h-full w-full" aria-label="Campus shuttle map">
-      <APIProvider apiKey={apiKey} language="en" region="MY" libraries={MAPS_LIBRARIES}>
-        <MapStatusWatcher />
-        <GoogleMap
-          mapId="DEMO_MAP_ID"
-          colorScheme={dark ? ColorScheme.DARK : ColorScheme.LIGHT}
-          defaultCenter={CAMPUS}
-          defaultZoom={15}
-          gestureHandling="greedy"
-          disableDefaultUI
-          clickableIcons={false}
-          internalUsageAttributionIds={["gmp_mcp_codeassist_v1_aistudio"]}
-          onClick={() => onSelectRef.current(null)}
-          className="h-full w-full"
-        >
-          <MapEffectsOverlay
-            shownRoutes={shownRoutes}
-            dark={dark}
-            journey={journey}
-            fitKey={props.fitKey}
-            pois={pois}
-            poiFitNonce={props.poiFitNonce ?? 0}
-            userLocation={userLocation}
-            locateNonce={props.locateNonce}
-            selection={selection}
-            focusNonce={props.focusNonce}
-            clock={clock}
-          />
-
-          {visibleStops.map((stop) => {
-            const isSel = selection?.type === "stop" && selection.id === stop.id;
-            return (
-              <AdvancedMarker
-                key={`stop-${stop.id}`}
-                position={{ lat: stop.lat, lng: stop.lng }}
-                title={stop.name}
-                anchorPoint={AdvancedMarkerAnchorPoint.BOTTOM}
-                zIndex={isSel ? 900 : 10}
-                onClick={() => onSelectRef.current({ type: "stop", id: stop.id })}
-              >
-                <StopMarkerIcon selected={isSel} dark={dark} />
-              </AdvancedMarker>
-            );
-          })}
-
-          {visiblePois.map((p) => {
-            const isSel =
-              selection?.type === "place" &&
-              selection.place.label === p.label &&
-              Math.abs(selection.place.lat - p.lat) < 0.0001 &&
-              Math.abs(selection.place.lng - p.lng) < 0.0001;
-            return (
-              <AdvancedMarker
-                key={`poi-${p.label}-${p.lat}-${p.lng}`}
-                position={{ lat: p.lat, lng: p.lng }}
-                title={p.label}
-                anchorPoint={AdvancedMarkerAnchorPoint.BOTTOM}
-                zIndex={isSel ? 1100 : 20}
-                onClick={() => onSelectRef.current({ type: "place", place: p })}
-              >
-                <PoiMarkerIcon cat={p.cat} selected={isSel} dark={dark} />
-              </AdvancedMarker>
-            );
-          })}
-
-          {visibleBusStates.map((b) => (
-            <AdvancedMarker
-              key={`bus-${b.bus}`}
-              position={{ lat: b.pos[0], lng: b.pos[1] }}
-              title={`Bus ${b.bus}`}
-              anchorPoint={AdvancedMarkerAnchorPoint.CENTER}
-              zIndex={b.zIndex}
-              onClick={() => onSelectRef.current({ type: "bus", id: b.bus })}
-            >
-              <BusMarkerIcon
-                label={b.bus}
-                color={b.color}
-                heading={b.heading}
-                selected={b.selected}
-                waiting={b.waiting}
-                dark={dark}
-              />
-            </AdvancedMarker>
-          ))}
-
-          {journeyTo && (
-            <AdvancedMarker
-              position={{ lat: journeyTo.lat, lng: journeyTo.lng }}
-              title={journeyTo.label}
-              anchorPoint={AdvancedMarkerAnchorPoint.BOTTOM}
-              zIndex={2500}
-            >
-              <DestinationMarkerIcon />
-            </AdvancedMarker>
-          )}
-
-          {journeyFrom && (
-            <AdvancedMarker
-              position={{ lat: journeyFrom.lat, lng: journeyFrom.lng }}
-              title={journeyFrom.label}
-              anchorPoint={AdvancedMarkerAnchorPoint.CENTER}
-              zIndex={2400}
-            >
-              <UserLocationDot isOrigin />
-            </AdvancedMarker>
-          )}
-
-          {userLocation && (
-            <AdvancedMarker
-              position={{ lat: userLocation.lat, lng: userLocation.lng }}
-              title="Your location"
-              anchorPoint={AdvancedMarkerAnchorPoint.CENTER}
-              zIndex={2300}
-            >
-              <UserLocationDot />
-            </AdvancedMarker>
-          )}
-        </GoogleMap>
-      </APIProvider>
-    </div>
-  );
-}
-
-function MapStatusWatcher() {
-  const status = useApiLoadingStatus();
+  // Render bus stops
   useEffect(() => {
-    if (status === APILoadingStatus.AUTH_FAILURE) {
-      window.dispatchEvent(new CustomEvent("gmp-quota-exceeded"));
+    const L = leafletRef.current;
+    const layer = stopsLayerRef.current;
+    if (!mapReady || !L || !layer) return;
+    layer.clearLayers();
+
+    for (const stop of visibleStops) {
+      const isSel = selection?.type === "stop" && selection.id === stop.id;
+      const marker = L.marker([stop.lat, stop.lng], {
+        icon: toDivIcon(L, stopMarkerSpec(isSel, dark)),
+        title: stop.name,
+        zIndexOffset: isSel ? 900 : 10,
+      });
+      marker.on("click", (e) => {
+        L.DomEvent.stopPropagation(e);
+        onSelectRef.current({ type: "stop", id: stop.id });
+      });
+      marker.addTo(layer);
     }
-  }, [status]);
-  return null;
-}
+  }, [mapReady, visibleStops, selection, dark]);
 
-function MapEffectsOverlay({
-  shownRoutes,
-  dark,
-  journey,
-  fitKey,
-  pois,
-  poiFitNonce,
-  userLocation,
-  locateNonce,
-  selection,
-  focusNonce,
-  clock,
-}: {
-  shownRoutes: RouteKey[];
-  dark: boolean;
-  journey: Journey | null;
-  fitKey: string;
-  pois: PlaceEntry[];
-  poiFitNonce: number;
-  userLocation: UserLocation | null;
-  locateNonce: number;
-  selection: Selection;
-  focusNonce: number;
-  clock: Clock;
-}) {
-  const map = useMap();
-  const mapsLib = useMapsLibrary("maps");
-
-  // Route polylines for selected bus
+  // Render campus POI markers
   useEffect(() => {
-    if (!map || !mapsLib || shownRoutes.length === 0) return;
-    const polylines: google.maps.Polyline[] = [];
-    const arrowSymbol: google.maps.Symbol = {
-      path: google.maps.SymbolPath.FORWARD_OPEN_ARROW,
-      scale: 2.1,
-      strokeColor: "#ffffff",
-      strokeWeight: 1.8,
-      strokeOpacity: 0.95,
-    };
+    const L = leafletRef.current;
+    const layer = poisLayerRef.current;
+    if (!mapReady || !L || !layer) return;
+    layer.clearLayers();
 
-    for (const k of shownRoutes) {
-      for (const half of [ROUTES[k].out, ROUTES[k].back]) {
-        const path = half.path.map(([lat, lng]) => ({ lat, lng }));
-        polylines.push(
-          new mapsLib.Polyline({
-            map,
-            path,
-            strokeColor: dark ? "#120b0c" : "#ffffff",
-            strokeOpacity: 0.9,
-            strokeWeight: 9,
-            clickable: false,
-            zIndex: 10,
-          }),
-          new mapsLib.Polyline({
-            map,
-            path,
-            strokeColor: ROUTE_META[k].color,
-            strokeOpacity: 0.95,
-            strokeWeight: 5.5,
-            clickable: false,
-            zIndex: 11,
-            icons: [{ icon: arrowSymbol, offset: "45px", repeat: "150px" }],
-          }),
-        );
+    for (const p of visiblePois) {
+      const isSel =
+        selection?.type === "place" &&
+        selection.place.label === p.label &&
+        Math.abs(selection.place.lat - p.lat) < 0.0001 &&
+        Math.abs(selection.place.lng - p.lng) < 0.0001;
+      const marker = L.marker([p.lat, p.lng], {
+        icon: toDivIcon(L, poiMarkerSpec(p.cat, isSel, dark)),
+        title: p.label,
+        zIndexOffset: isSel ? 1100 : 20,
+      });
+      marker.on("click", (e) => {
+        L.DomEvent.stopPropagation(e);
+        onSelectRef.current({ type: "place", place: p });
+      });
+      marker.addTo(layer);
+    }
+  }, [mapReady, visiblePois, selection, dark]);
+
+  // Smoothly update live bus markers without recreating DOM elements every tick
+  useEffect(() => {
+    const L = leafletRef.current;
+    const layer = busLayerRef.current;
+    if (!mapReady || !L || !layer) return;
+
+    const seen = new Set<string>();
+    const existing = busMarkersRef.current;
+
+    for (const b of visibleBusStates) {
+      seen.add(b.bus);
+      const h6 = Math.round(b.heading / 6) * 6;
+      const iconKey = `${b.color}:${h6}:${b.selected ? 1 : 0}:${b.waiting ? 1 : 0}:${dark ? 1 : 0}`;
+      const entry = existing.get(b.bus);
+
+      if (entry) {
+        entry.marker.setLatLng(b.pos);
+        entry.marker.setZIndexOffset(b.zIndex);
+        if (entry.iconKey !== iconKey) {
+          entry.marker.setIcon(
+            toDivIcon(
+              L,
+              busMarkerSpec({
+                label: b.bus,
+                color: b.color,
+                heading: b.heading,
+                selected: b.selected,
+                waiting: b.waiting,
+                dark,
+              }),
+            ),
+          );
+          entry.iconKey = iconKey;
+        }
+      } else {
+        const marker = L.marker(b.pos, {
+          icon: toDivIcon(
+            L,
+            busMarkerSpec({
+              label: b.bus,
+              color: b.color,
+              heading: b.heading,
+              selected: b.selected,
+              waiting: b.waiting,
+              dark,
+            }),
+          ),
+          title: `Bus ${b.bus}`,
+          zIndexOffset: b.zIndex,
+        });
+        marker.on("click", (e) => {
+          L.DomEvent.stopPropagation(e);
+          onSelectRef.current({ type: "bus", id: b.bus });
+        });
+        marker.addTo(layer);
+        existing.set(b.bus, { marker, iconKey });
       }
     }
 
-    return () => {
-      for (const line of polylines) line.setMap(null);
-    };
-  }, [map, mapsLib, shownRoutes, dark]);
+    for (const [bus, entry] of existing) {
+      if (!seen.has(bus)) {
+        layer.removeLayer(entry.marker);
+        existing.delete(bus);
+      }
+    }
+  }, [mapReady, visibleBusStates, dark]);
+
+  // Selected bus route polylines
+  useEffect(() => {
+    const L = leafletRef.current;
+    const layer = routesLayerRef.current;
+    if (!mapReady || !L || !layer) return;
+    layer.clearLayers();
+    if (shownRoutes.length === 0) return;
+
+    for (const k of shownRoutes) {
+      const color = ROUTE_META[k].color;
+      for (const half of [ROUTES[k].out, ROUTES[k].back]) {
+        L.polyline(half.path, {
+          color: dark ? "#120b0c" : "#ffffff",
+          opacity: 0.9,
+          weight: 9,
+          interactive: false,
+        }).addTo(layer);
+        L.polyline(half.path, {
+          color,
+          opacity: 0.95,
+          weight: 5.5,
+          interactive: false,
+        }).addTo(layer);
+        for (const arrow of sampleRouteArrows(half.path, 190)) {
+          L.marker(arrow.pos, {
+            icon: toDivIcon(L, routeArrowSpec(arrow.heading)),
+            interactive: false,
+          }).addTo(layer);
+        }
+      }
+    }
+  }, [mapReady, shownRoutes, dark]);
 
   // Planned trip legs: dotted walking legs and coloured bus legs
   useEffect(() => {
-    if (!map || !mapsLib || !journey) return;
-    const polylines: google.maps.Polyline[] = [];
-    const walkDotCasing: google.maps.Symbol = {
-      path: google.maps.SymbolPath.CIRCLE,
-      fillColor: dark ? "#0f172a" : "#ffffff",
-      fillOpacity: 0.9,
-      strokeOpacity: 0,
-      scale: 3.6,
-    };
-    const walkDot: google.maps.Symbol = {
-      path: google.maps.SymbolPath.CIRCLE,
-      fillColor: "#1a73e8",
-      fillOpacity: 1,
-      strokeOpacity: 0,
-      scale: 2.3,
-    };
-    const arrowSymbol: google.maps.Symbol = {
-      path: google.maps.SymbolPath.FORWARD_OPEN_ARROW,
-      scale: 2.2,
-      strokeColor: "#ffffff",
-      strokeWeight: 2,
-      strokeOpacity: 0.95,
-    };
+    const L = leafletRef.current;
+    const layer = journeyLayerRef.current;
+    if (!mapReady || !L || !layer) return;
+    layer.clearLayers();
+    if (!journey) return;
 
     for (const leg of journey.legs) {
-      const path = leg.path.map(([lat, lng]) => ({ lat, lng }));
       if (leg.kind === "walk") {
-        polylines.push(
-          new mapsLib.Polyline({
-            map,
-            path,
-            strokeOpacity: 0,
-            clickable: false,
-            zIndex: 20,
-            icons: [{ icon: walkDotCasing, offset: "0", repeat: "12px" }],
-          }),
-          new mapsLib.Polyline({
-            map,
-            path,
-            strokeOpacity: 0,
-            clickable: false,
-            zIndex: 21,
-            icons: [{ icon: walkDot, offset: "0", repeat: "12px" }],
-          }),
-        );
+        L.polyline(leg.path, {
+          color: dark ? "#0f172a" : "#ffffff",
+          opacity: 0.9,
+          weight: 7.5,
+          dashArray: "0 12",
+          lineCap: "round",
+          interactive: false,
+        }).addTo(layer);
+        L.polyline(leg.path, {
+          color: "#1a73e8",
+          opacity: 1,
+          weight: 4.5,
+          dashArray: "0 12",
+          lineCap: "round",
+          interactive: false,
+        }).addTo(layer);
       } else {
         const color = ROUTE_META[leg.trip.service.route].color;
-        polylines.push(
-          new mapsLib.Polyline({
-            map,
-            path,
-            strokeColor: dark ? "#120b0c" : "#ffffff",
-            strokeOpacity: 0.95,
-            strokeWeight: 10,
-            clickable: false,
-            zIndex: 22,
-          }),
-          new mapsLib.Polyline({
-            map,
-            path,
-            strokeColor: color,
-            strokeOpacity: 1,
-            strokeWeight: 6.5,
-            clickable: false,
-            zIndex: 23,
-            icons: [{ icon: arrowSymbol, offset: "45px", repeat: "130px" }],
-          }),
-        );
+        L.polyline(leg.path, {
+          color: dark ? "#120b0c" : "#ffffff",
+          opacity: 0.95,
+          weight: 10,
+          interactive: false,
+        }).addTo(layer);
+        L.polyline(leg.path, {
+          color,
+          opacity: 1,
+          weight: 6.5,
+          interactive: false,
+        }).addTo(layer);
+        for (const arrow of sampleRouteArrows(leg.path, 160)) {
+          L.marker(arrow.pos, {
+            icon: toDivIcon(L, routeArrowSpec(arrow.heading)),
+            interactive: false,
+          }).addTo(layer);
+        }
       }
     }
+  }, [mapReady, journey, dark]);
 
-    return () => {
-      for (const line of polylines) line.setMap(null);
-    };
-  }, [map, mapsLib, journey, dark]);
-
-  // Accuracy halo circle around user location
-  const haloRef = useRef<google.maps.Circle | null>(null);
+  // Journey destination + origin pins
   useEffect(() => {
-    if (!map || !mapsLib) return;
+    const L = leafletRef.current;
+    const map = mapRef.current;
+    if (!mapReady || !L || !map) return;
+
+    if (destMarkerRef.current) {
+      destMarkerRef.current.remove();
+      destMarkerRef.current = null;
+    }
+    if (journeyTo) {
+      destMarkerRef.current = L.marker([journeyTo.lat, journeyTo.lng], {
+        icon: toDivIcon(L, destinationMarkerSpec()),
+        title: journeyTo.label,
+        zIndexOffset: 2500,
+      }).addTo(map);
+    }
+
+    if (originMarkerRef.current) {
+      originMarkerRef.current.remove();
+      originMarkerRef.current = null;
+    }
+    if (journeyFrom) {
+      originMarkerRef.current = L.marker([journeyFrom.lat, journeyFrom.lng], {
+        icon: toDivIcon(L, userDotSpec(true)),
+        title: journeyFrom.label,
+        zIndexOffset: 2400,
+      }).addTo(map);
+    }
+  }, [mapReady, journeyTo, journeyFrom]);
+
+  // User location dot and accuracy halo
+  useEffect(() => {
+    const L = leafletRef.current;
+    const map = mapRef.current;
+    if (!mapReady || !L || !map) return;
+
     if (!userLocation) {
-      haloRef.current?.setMap(null);
-      haloRef.current = null;
+      userHaloRef.current?.remove();
+      userHaloRef.current = null;
+      userMarkerRef.current?.remove();
+      userMarkerRef.current = null;
       return;
     }
-    const center = { lat: userLocation.lat, lng: userLocation.lng };
-    if (!haloRef.current) {
-      haloRef.current = new mapsLib.Circle({
-        map,
-        center,
+
+    const center: [number, number] = [userLocation.lat, userLocation.lng];
+    if (!userHaloRef.current) {
+      userHaloRef.current = L.circle(center, {
         radius: userLocation.accuracy,
         fillColor: "#1a73e8",
         fillOpacity: 0.14,
-        strokeColor: "#1a73e8",
-        strokeOpacity: 0.38,
-        strokeWeight: 1,
-        clickable: false,
-        zIndex: 5,
-      });
+        color: "#1a73e8",
+        opacity: 0.38,
+        weight: 1,
+        interactive: false,
+      }).addTo(map);
     } else {
-      haloRef.current.setCenter(center);
-      haloRef.current.setRadius(userLocation.accuracy);
+      userHaloRef.current.setLatLng(center);
+      userHaloRef.current.setRadius(userLocation.accuracy);
     }
-  }, [map, mapsLib, userLocation]);
 
-  useEffect(() => {
-    return () => {
-      haloRef.current?.setMap(null);
-      haloRef.current = null;
-    };
-  }, []);
+    if (!userMarkerRef.current) {
+      userMarkerRef.current = L.marker(center, {
+        icon: toDivIcon(L, userDotSpec(false)),
+        title: "Your location",
+        zIndexOffset: 2300,
+        interactive: false,
+      }).addTo(map);
+    } else {
+      userMarkerRef.current.setLatLng(center);
+    }
+  }, [mapReady, userLocation]);
 
   // Fit bounds on planned trip
   const journeyRef = useRef(journey);
   journeyRef.current = journey;
   useEffect(() => {
+    const L = leafletRef.current;
+    const map = mapRef.current;
     const j = journeyRef.current;
-    if (!map || !j || !fitKey) return;
-    const bounds = new google.maps.LatLngBounds();
-    let count = 0;
-    for (const leg of j.legs) {
-      for (const [lat, lng] of leg.path) {
-        bounds.extend({ lat, lng });
-        count++;
-      }
-    }
-    if (count === 0) return;
-    const wide = window.innerWidth >= 640;
-    map.fitBounds(
-      bounds,
-      wide
-        ? { top: 88, left: 430, right: 64, bottom: 48 }
-        : { top: 120, left: 28, right: 28, bottom: Math.round(window.innerHeight * 0.56) },
-    );
-  }, [map, fitKey]);
+    if (!mapReady || !L || !map || !j || !fitKey) return;
 
-  // Fit bounds when user filters a category via Search
+    const coords: [number, number][] = [];
+    for (const leg of j.legs) {
+      for (const p of leg.path) coords.push(p);
+    }
+    if (coords.length === 0) return;
+
+    const wide = window.innerWidth >= 640;
+    map.fitBounds(L.latLngBounds(coords), {
+      paddingTopLeft: wide ? [430, 88] : [28, 120],
+      paddingBottomRight: wide ? [64, 48] : [28, Math.round(window.innerHeight * 0.56)],
+      animate: true,
+    });
+  }, [mapReady, fitKey]);
+
+  // Fit bounds when user filters a category or search results via Search
   const poisRef = useRef(pois);
   poisRef.current = pois;
   useEffect(() => {
+    const L = leafletRef.current;
+    const map = mapRef.current;
     const list = poisRef.current;
-    if (!map || poiFitNonce === 0 || list.length === 0) return;
-    const bounds = new google.maps.LatLngBounds();
-    for (const p of list) bounds.extend({ lat: p.lat, lng: p.lng });
-    map.fitBounds(bounds, { top: 76, right: 48, bottom: 72, left: 48 });
-  }, [map, poiFitNonce]);
+    if (!mapReady || !L || !map || poiFitNonce === 0 || list.length === 0) return;
+    const bounds = L.latLngBounds(list.map((p) => [p.lat, p.lng] as [number, number]));
+    map.fitBounds(bounds, {
+      paddingTopLeft: [48, 76],
+      paddingBottomRight: [48, 72],
+      maxZoom: 17,
+      animate: true,
+    });
+  }, [mapReady, poiFitNonce]);
 
   // Pan to user location when requested
   const userLocRef = useRef(userLocation);
   userLocRef.current = userLocation;
   useEffect(() => {
+    const map = mapRef.current;
     const loc = userLocRef.current;
-    if (!map || !loc || locateNonce === 0) return;
-    map.panTo({ lat: loc.lat, lng: loc.lng });
-    if ((map.getZoom() ?? 0) < 16) map.setZoom(17);
-  }, [map, locateNonce]);
+    if (!mapReady || !map || !loc || locateNonce === 0) return;
+    map.setView([loc.lat, loc.lng], Math.max(map.getZoom(), 17), { animate: true });
+  }, [mapReady, locateNonce]);
 
   // Pan to selected bus, stop, or campus place
   useEffect(() => {
-    if (!map || !selection) return;
+    const map = mapRef.current;
+    if (!mapReady || !map || !selection) return;
+    let target: [number, number] | null = null;
     if (selection.type === "stop") {
       const s = STOP_BY_ID[selection.id];
-      if (s) map.panTo({ lat: s.lat, lng: s.lng });
+      if (s) target = [s.lat, s.lng];
     } else if (selection.type === "place") {
-      map.panTo({ lat: selection.place.lat, lng: selection.place.lng });
+      target = [selection.place.lat, selection.place.lng];
     } else {
       const st = busState(selection.id, clock.day, clock.minutes);
-      if (st.kind !== "off") map.panTo({ lat: st.pos[0], lng: st.pos[1] });
+      if (st.kind !== "off") target = st.pos;
     }
-    if ((map.getZoom() ?? 0) < 15) map.setZoom(16);
+    if (target) {
+      map.setView(target, Math.max(map.getZoom(), 16), { animate: true });
+    }
     // Only pan when user explicitly picks an item, not on every clock tick.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [map, focusNonce]);
+  }, [mapReady, focusNonce]);
 
-  return null;
+  return (
+    <div
+      ref={containerRef}
+      className={cn(
+        "utm-osm-map absolute inset-0 z-0 isolate h-full w-full",
+        dark && "utm-osm-dark",
+      )}
+      aria-label="Campus shuttle map"
+    />
+  );
 }

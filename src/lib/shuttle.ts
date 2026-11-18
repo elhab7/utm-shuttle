@@ -40,12 +40,31 @@ export function metres(a: LatLng, b: LatLng) {
 }
 
 function buildHalf(raw: RawHalf): Half {
-  const path = raw.path.map((p) => [p[0], p[1]] as LatLng);
+  let path = raw.path.map((p) => [p[0], p[1]] as LatLng);
+  const cpStop = STOP_BY_ID["cp"];
+  const skippedCp = raw.stops.find(
+    (s, idx, arr) => s.id === "cp" && idx > 0 && arr[idx + 1]?.id === "krp_g11",
+  );
+  // Buses going from Lingkaran Ilmu to Jalan Meranti pass CP without stopping there and stop at KRP G11 instead.
+  let savedM = 0;
+  let cpCutD = Infinity;
+  if (skippedCp && cpStop) {
+    const cpPos: LatLng = [cpStop.lat, cpStop.lng];
+    const cpIdx = path.findIndex((pt, i) => i > 0 && i < path.length - 1 && metres(pt, cpPos) < 25);
+    if (cpIdx > 0) {
+      const prev = path[cpIdx - 1]!;
+      const cur = path[cpIdx]!;
+      const next = path[cpIdx + 1]!;
+      savedM = metres(prev, cur) + metres(cur, next) - metres(prev, next);
+      cpCutD = skippedCp.d;
+      path = [...path.slice(0, cpIdx), ...path.slice(cpIdx + 1)];
+    }
+  }
   const cum = [0];
   for (let i = 1; i < path.length; i++) cum.push(cum[i - 1]! + metres(path[i - 1]!, path[i]!));
   const length = cum[cum.length - 1] ?? 1;
-  const scale = length / (raw.lengthM || length);
-  // Buses going from Lingkaran Ilmu to Jalan Meranti pass CP without stopping there and stop at KRP G11 instead.
+  const rawAdjustedLength = Math.max(1, (raw.lengthM || length) - savedM);
+  const scale = length / rawAdjustedLength;
   const rawStops = raw.stops.filter((s, idx, arr) => {
     if (s.id === "cp" && idx > 0 && arr[idx + 1]?.id === "krp_g11") return false;
     return true;
@@ -54,7 +73,10 @@ function buildHalf(raw: RawHalf): Half {
     path,
     cum,
     length,
-    stops: rawStops.map((s) => ({ id: s.id, d: Math.min(length, s.d * scale) })),
+    stops: rawStops.map((s) => ({
+      id: s.id,
+      d: Math.min(length, Math.max(0, (s.d > cpCutD ? s.d - savedM : s.d) * scale)),
+    })),
     durationS: raw.durationS,
   };
 }

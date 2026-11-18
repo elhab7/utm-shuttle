@@ -148,12 +148,33 @@ describe("days never mix", () => {
 });
 
 describe("route stop rules", () => {
-  it("skips CP and stops at KRP G11 when heading from Lingkaran Ilmu to Jalan Meranti", async () => {
-    const { ROUTES } = await import("@/lib/shuttle");
+  it("skips CP (including CP bay path detour) and stops at KRP G11 when heading from Lingkaran Ilmu to Jalan Meranti", async () => {
+    const { STOP_BY_ID } = await import("@/data/stops");
+    const { ROUTES, metres, pointAt } = await import("@/lib/shuttle");
+    const cp = STOP_BY_ID["cp"]!;
+    const krpG11 = STOP_BY_ID["krp_g11"]!;
     for (const k of ["EN", "ED", "EW"] as const) {
-      const ids = ROUTES[k].back.stops.map((s) => s.id);
+      const half = ROUTES[k].back;
+      const ids = half.stops.map((s) => s.id);
       expect(ids).not.toContain("cp");
       expect(ids).toContain("krp_g11");
+      // Path itself turns directly at the junction onto Jalan Meranti instead of entering CP bay
+      const entersCpBay = half.path.some((pt) => metres(pt, [cp.lat, cp.lng]) < 30);
+      expect(entersCpBay).toBe(false);
+      // KRP G11 stop distance still aligns closely with the actual KRP G11 stop coordinates
+      const g11Stop = half.stops.find((s) => s.id === "krp_g11")!;
+      const g11Pos = pointAt(half, g11Stop.d).pos;
+      expect(metres(g11Pos, [krpG11.lat, krpG11.lng])).toBeLessThan(80);
     }
+
+    // Back trips of EN/ED/EW must appear at KRP G11 but never at CP
+    const cpArr = arrivalsAt("cp", MON, toMin("7:00"), undefined, 12 * 60);
+    expect(
+      cpArr.some((a) => ["EN", "ED", "EW"].includes(a.trip.service.route) && a.trip.dir === "back"),
+    ).toBe(false);
+    const g11Arr = arrivalsAt("krp_g11", MON, toMin("7:00"), undefined, 12 * 60);
+    expect(
+      g11Arr.some((a) => ["EN", "ED"].includes(a.trip.service.route) && a.trip.dir === "back"),
+    ).toBe(true);
   });
 });

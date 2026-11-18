@@ -4,6 +4,7 @@
 @import "tailwindcss" source(none);
 @source "../src";
 @import "tw-animate-css";
+@import "leaflet/dist/leaflet.css";
 
 /* Theme follows the browser / OS setting. */
 @custom-variant dark (@media (prefers-color-scheme: dark));
@@ -242,4 +243,32 @@
 
 @utility animate-live-pulse {
   animation: live-pulse 1.8s ease-out infinite;
+}
+
+.utm-osm-map {
+  background: var(--background);
+  font-family: var(--font-sans);
+}
+
+.utm-osm-dark .leaflet-tile-pane {
+  filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.88) saturate(0.88);
+}
+
+.utm-osm-icon {
+  background: transparent;
+  border: 0;
+}
+
+.utm-osm-map .leaflet-control-attribution {
+  background: var(--glass);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: var(--muted-foreground);
+  font-size: 10px;
+  border-top-left-radius: 10px;
+  padding: 2px 6px;
+}
+
+.utm-osm-map .leaflet-control-attribution a {
+  color: var(--foreground);
 }
